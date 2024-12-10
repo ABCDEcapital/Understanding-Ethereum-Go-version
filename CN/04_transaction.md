@@ -33,29 +33,83 @@ type Transaction struct {
 目前，`TxData`类型是一个接口，它的定义如下面的代码所示。
 
 ```go
+// TxData 定义了以太坊交易的核心接口，包含了所有交易类型共有的方法
 type TxData interface {
- txType() byte // returns the type ID
- copy() TxData // creates a deep copy and initializes all fields
+    // txType 返回交易类型的标识符
+    // 0x00: Legacy
+    // 0x01: AccessList
+    // 0x02: DynamicFee (EIP-1559)
+    // 0x03: Blob (EIP-4844)
+    txType() byte 
 
- chainID() *big.Int
- accessList() AccessList
- data() []byte
- gas() uint64
- gasPrice() *big.Int
- gasTipCap() *big.Int
- gasFeeCap() *big.Int
- value() *big.Int
- nonce() uint64
- to() *common.Address
+    // copy 创建交易数据的深拷贝
+    // 用于确保交易数据的不可变性
+    copy() TxData 
 
- rawSignatureValues() (v, r, s *big.Int)
- setSignatureValues(chainID, v, r, s *big.Int)
+    // chainID 返回交易的链 ID
+    // 用于防止交易重放攻击（EIP-155）
+    chainID() *big.Int
+
+    // accessList 返回交易的访问列表
+    // EIP-2930 引入，用于优化 gas 消耗
+    accessList() AccessList
+
+    // data 返回交易的输入数据
+    // 包含合约调用的方法签名和参数
+    data() []byte
+
+    // gas 返回交易的 gas 限制
+    // 表示愿意为交易执行支付的最大 gas 量
+    gas() uint64
+
+    // gasPrice 返回交易的 gas 价格
+    // 对于传统交易，这是固定值
+    gasPrice() *big.Int
+
+    // gasTipCap 返回最大优先费用（小费）
+    // EIP-1559 引入，用于激励矿工优先打包
+    gasTipCap() *big.Int
+
+    // gasFeeCap 返回最大总费用
+    // EIP-1559 引入，gas_fee_cap = base_fee + priority_fee
+    gasFeeCap() *big.Int
+
+    // value 返回交易转账的 ETH 数量
+    value() *big.Int
+
+    // nonce 返回发送方的交易序号
+    // 用于防止重放攻击和确保交易顺序
+    nonce() uint64
+
+    // to 返回接收方地址
+    // 如果是合约创建交易，返回 nil
+    to() *common.Address
+
+    // rawSignatureValues 返回交易签名的原始值
+    // v: 签名恢复标识符
+    // r,s: 签名的两个组成部分
+    rawSignatureValues() (v, r, s *big.Int)
+
+    // setSignatureValues 设置交易的签名值
+    // 用于在交易签名后更新签名数据
+    setSignatureValues(chainID, v, r, s *big.Int)
+
+    // effectiveGasPrice 计算交易实际的 gas 价格
+    // 对于 EIP-1559 交易，这取决于区块的 base fee
+    // 返回值是独立的副本，调用者可以安全修改
+    effectiveGasPrice(dst *big.Int, baseFee *big.Int) *big.Int
+
+    // encode 将交易数据编码到缓冲区
+    // 用于序列化交易数据
+    encode(*bytes.Buffer) error
+
+    // decode 从字节数据解码交易
+    // 用于反序列化交易数据
+    decode([]byte) error
 }
 ```
 
 这里注意，在目前版本的geth中(1.10.*)，根据[EIP-2718][EIP2718]的设计，原来的TxData现在被声明成了一个interface，而不是定义了具体的结构。这样的设计好处在于，后续版本的更新中可以对Transaction类型进行更加灵活的修改。目前，在Ethereum中定义了三种类型的Transaction来实现TxData这个接口。按照时间上的定义顺序来说，这三种类型的Transaction分别是，LegacyT，AccessListTx，TxDynamicFeeTx。LegacyTx顾名思义，是原始的Ethereum的Transaction设计，目前市面上大部分早年关于Ethereum Transaction结构的文档实际上都是在描述LegacyTx的结构。而AccessListTX是基于EIP-2930(Berlin分叉)的Transaction。DynamicFeeTx是[EIP-1559](https://eips.ethereum.org/EIPS/eip-1559)(伦敦分叉)生效之后的默认的Transaction。
-
-(PS:目前Ethereum的黄皮书只更新到了Berlin分叉的内容，还没有添加London分叉的更新, 2022.3.10)
 
 ### LegacyTx
 LegacyTx 是最原始的以太坊交易的定义。
@@ -123,7 +177,7 @@ Transaction的执行主要在发生在两个Workflow中:
 
 ### Transaction修改Contract的持久化存储的
 
-在Ethereum中，当Miner开始构造新的区块的时候，首先会启动*miner/worker.go*的 `mainLoop()`函数。具体的函数如下所示。
+在Ethereum中，当Miner开始构造新的区块的时候，首先会启动*miner/worker.go*的 `generateWork()`函数。具体的函数如下所示。
 
 ```go
 func (w *worker) mainLoop() {
@@ -148,7 +202,7 @@ func (w *worker) mainLoop() {
 
 在Mining新区块前，Worker首先需要决定，哪些Transaction会被打包到新的Block中。这里选取Transaction其实经历了两个步骤。首先，`txs`变量保存了从Transaction Pool中拿去到的合法的，以及准备好被打包的交易。这里举一个例子，来说明什么是**准备好被打包的交易**，比如Alice先后发了新三个交易到网络中，对应的Nonce分别是100和101，102。假如Miner只收到了100和102号交易。那么对于此刻的Transaction Pool来说Nonce 100的交易就是**准备好被打包的交易**，交易Nonce 是102需要等待Nonce 101的交易被确认之后才能提交。
 
-在Worker会从Transaction Pool中拿出若干的transaction, 赋值给*txs*之后, 然后调用`NewTransactionsByPriceAndNonce`函数按照Gas Price和Nonce对*txs*进行排序，并将结果赋值给*txset*。此外在Worker的实例中，还存在`fillTransactions`函数，为了未来定制化的给Transaction的执行顺序进行排序。
+在Worker会从Transaction Pool中拿出若干的transaction, 赋值给*txs*之后, 然后调用`newTransactionsByPriceAndNonce`函数按照Gas Price和Nonce对*txs*进行排序，并将结果赋值给*txset*。此外在Worker的实例中，还存在`fillTransactions`函数，为了未来定制化的给Transaction的执行顺序进行排序。
 
 在拿到*txset*之后，mainLoop函数会调用`commitTransactions`函数，正式进入Mining新区块的流程。`commitTransactions`函数如下所示。
 
